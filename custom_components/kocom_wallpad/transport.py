@@ -26,7 +26,9 @@ class AsyncConnection:
         self._writer: Optional[asyncio.StreamWriter] = None
         self._last_activity_mono: float = time.monotonic()
         self._last_reconn_delay: float = 0.0
-        self._connected = True
+        self._connected = False
+        self._reconn_lock = asyncio.Lock()
+        self._read_lock = asyncio.Lock()
 
     async def open(self) -> None:
         try:
@@ -45,23 +47,24 @@ class AsyncConnection:
             self._touch()
         except Exception as e:
             LOGGER.warning("Connection open failed: %r", e)
+            self._connected = False
             await self.reconnect()
 
     async def close(self) -> None:
+        self._connected = False
         if self._writer is not None:
             LOGGER.info("Closing connection")
-            self._writer.close()
             try:
+                self._writer.close()
                 await self._writer.wait_closed()
             except Exception:
                 pass
             finally:
                 self._writer = None
         self._reader = None
-        self._connected = False
 
     def _is_connected(self) -> bool:
-        return self._connected
+        return self._connected and self._writer is not None
 
     def _touch(self) -> None:
         self._last_activity_mono = time.monotonic()
@@ -70,8 +73,8 @@ class AsyncConnection:
         return max(0.0, time.monotonic() - self._last_activity_mono)
 
     async def send(self, data: bytes) -> int:
-        if not self._writer:
-            raise RuntimeError("connection not open")
+        if not self._is_connected() or not self._writer:
+            raise ConnectionResetError("Connection lost")
         try:
             LOGGER.debug("Sending: %s", data.hex())
             self._writer.write(data)
@@ -80,41 +83,52 @@ class AsyncConnection:
             return len(data)
         except Exception as e:
             LOGGER.warning("Send failed: %r", e)
-            await self.reconnect()
-            return 0
+            asyncio.create_task(self.reconnect())
+            raise ConnectionResetError("Connection lost") from e
 
     async def recv(self, nbytes: int, timeout: float = 0.05) -> bytes:
-        if not self._reader:
-            raise RuntimeError("connection not open")
-        try:
-            chunk = await asyncio.wait_for(self._reader.read(nbytes), timeout=timeout)
-        except asyncio.TimeoutError:
+        if not self._is_connected() or not self._reader:
+            await asyncio.sleep(0.5)
             return b""
-        except Exception as e:
-            LOGGER.warning("Recv failed: %r", e)
-            await self.reconnect()
-            return b""
-        if chunk:
-            self._touch()
-        return chunk
+
+        async with self._read_lock:
+            try:
+                # wait_for를 제거하고 데이터가 들어올 때까지 대기
+                chunk = await self._reader.read(nbytes)
+                if not chunk:
+                    LOGGER.warning("Connection closed by peer (EOF)")
+                    asyncio.create_task(self.reconnect())
+                    return b""
+                self._touch()
+                return chunk
+            except Exception as e:
+                LOGGER.warning("Recv failed: %r", e)
+                asyncio.create_task(self.reconnect())
+                return b""
 
     async def reconnect(self) -> None:
-        self._connected = False
-        delay_min, delay_max = self.reconnect_backoff
-        if self._last_reconn_delay > 0.0:
-            delay = self._last_reconn_delay
-        else:
-            delay = delay_min
+        if self._reconn_lock.locked():
+            return
 
-        if self._writer is not None:
-            self._writer.close()
-            await self._writer.wait_closed()
-        
-        LOGGER.info("Connection lost. Reconnecting in %.1f sec...", delay)
-        await asyncio.sleep(delay)
-        self._last_reconn_delay = min(delay * 2, delay_max)
-        await self.open()
+        async with self._reconn_lock:
+            self._connected = False
+            delay_min, delay_max = self.reconnect_backoff
+            delay = self._last_reconn_delay if self._last_reconn_delay > 0.0 else delay_min
 
-        if self._is_connected():
-            LOGGER.info("Connection reconnected")
-            self._last_reconn_delay = delay_min
+            if self._writer is not None:
+                try:
+                    self._writer.close()
+                    await self._writer.wait_closed()
+                except Exception:
+                    pass
+                self._writer = None
+            self._reader = None
+
+            LOGGER.info("Connection lost. Reconnecting in %.1f sec...", delay)
+            await asyncio.sleep(delay)
+            self._last_reconn_delay = min(delay * 2, delay_max)
+            await self.open()
+
+            if self._is_connected():
+                LOGGER.info("Connection reconnected")
+                self._last_reconn_delay = delay_min

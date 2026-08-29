@@ -348,10 +348,15 @@ class KocomController:
             speed = frame.payload[2]
             co2_value = (frame.payload[4] * 100) + frame.payload[5]
             error_code = frame.payload[6]
-
+            
+            excluded_modes = {"unknown", "air purification"}
+            available_presets = [
+                v for k, v in VENTILATION_PRESET_MAP.items() if v not in excluded_modes
+            ]
+            
             attribute = {
-                "feature_preset": self._device_storage.get("ventil_feature", False),
-                "preset_modes": self._device_storage.get("ventil_modes", []),
+                "feature_preset": True,
+                "preset_modes": available_presets,
                 "speed_list": [0x40, 0x80, 0xC0]
             }
             state = {
@@ -669,9 +674,15 @@ class KocomController:
         elif action == "set_percentage":
             speed = kwargs["speed"]
             data[0] = 0x00 if speed == 0 else 0x11
+            data[1] = 0x01
+            data[2] = speed
+        elif action == "turn_on":
+            speed = kwargs.get("speed", 0x80)
+            data[0] = 0x11
+            data[1] = 0x01
             data[2] = speed
         else:
-            data[0] = 0x11 if action == "turn_on" else 0x00
+            data[0] = 0x00
         return data
     
     def _generate_thermostat(self, action: str, data: bytes, **kwargs: Any) -> bytes:
@@ -707,3 +718,20 @@ class KocomController:
             data[5] = int(tt)
         return data
     
+    def generate_poll_command(self, device_type: DeviceType, room_index: int = 0) -> bytes:
+        """기기 상태 조회를 위한 Query 패킷 생성."""
+        if device_type not in REV_DT_MAP:
+            raise ValueError(f"Invalid device type: {device_type}")
+
+        type_bytes = bytes([0x30, 0xBC])
+        padding = bytes([0x00])
+        dest_dev = bytes([REV_DT_MAP[device_type]])
+        dest_room = bytes([room_index & 0xFF])
+        src_dev = bytes([0x01])
+        src_room = bytes([0x00])
+        command = bytes([0x3A])  # 코콤 상태 조회(Query/Poll) 커맨드 (환경에 맞춰 0x00 또는 0x3A 지정)
+        data = bytes(8)          # 조회 시 페이로드는 0x00으로 채움
+
+        body = b"".join([type_bytes, padding, dest_dev, dest_room, src_dev, src_room, command, data])
+        checksum = bytes([self._checksum(body)])
+        return bytes([0xAA, 0x55]) + body + checksum + bytes([0x0D, 0x0D])

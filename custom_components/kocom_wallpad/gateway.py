@@ -124,6 +124,9 @@ class KocomGateway:
         self._tx_queue: asyncio.Queue[_CmdItem] = asyncio.Queue()
         self._task_reader: asyncio.Task | None = None
         self._task_sender: asyncio.Task | None = None
+        self._task_poller: asyncio.Task | None = None
+        self._poll_interval: float = 60.0  # 1분 주기
+        self._scanning_interval: float = 0.8
         self._pendings: list[_PendingWaiter] = []
         self._last_rx_monotonic: float = 0.0
         self._last_tx_monotonic: float = 0.0
@@ -137,18 +140,23 @@ class KocomGateway:
         self._last_tx_monotonic = self.conn.idle_since()
         self._task_reader = asyncio.create_task(self._read_loop())
         self._task_sender = asyncio.create_task(self._sender_loop())
+        self._task_poller = asyncio.create_task(self._poll_loop())
 
     async def async_stop(self, event: Event | None = None) -> None:
         LOGGER.info("Stopping gateway - %s:%s", self.host, self.port or "")
-        if self._task_reader:
-            self._task_reader.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
-                await self._task_reader
-        if self._task_sender:
-            self._task_sender.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
-                await self._task_sender
+        
+        # 1. 실행 중인 태스크 취소 목록 구성
+        tasks = [t for t in (self._task_poller, self._task_sender, self._task_reader) if t]
+        for t in tasks:
+            t.cancel()
+
+        # 2. 소켓 스트림 종료
         await self.conn.close()
+
+        # 3. 모든 태스크가 안전하게 빠져나올 때까지 대기 (Task was destroyed 경고 방지)
+        for t in tasks:
+            with contextlib.suppress(asyncio.CancelledError):
+                await t
 
     def is_idle(self) -> bool:
         return self.conn.idle_since() >= IDLE_GAP_SEC
@@ -158,7 +166,7 @@ class KocomGateway:
             LOGGER.debug("Starting read loop")
             while True:
                 if not self.conn._is_connected():
-                    await asyncio.sleep(5)
+                    await asyncio.sleep(2)
                     continue
                 chunk = await self.conn.recv(512, RECV_POLL_SEC)
                 if chunk:
@@ -166,7 +174,9 @@ class KocomGateway:
                     self.controller.feed(chunk)
         except asyncio.CancelledError:
             LOGGER.debug("Read loop cancelled")
-            raise
+            return
+        except Exception as e:
+            LOGGER.exception("Unexpected error in read loop: %s", e)
 
     async def async_send_action(self, key: DeviceKey, action: str, **kwargs) -> bool:
         item = _CmdItem(key=key, action=action, kwargs=kwargs)
@@ -175,7 +185,6 @@ class KocomGateway:
             res = await item.future   # 워커가 set_result(True/False)
             return bool(res)
         except asyncio.CancelledError:
-            # 정지 중이라면 False로 정리
             if not item.future.done():
                 item.future.set_result(False)
             raise
@@ -255,7 +264,6 @@ class KocomGateway:
                 if p.key.key == dev.key.key and p.predicate(dev):
                     hit.append(p)
             except Exception:
-                # predicate 내부 오류 방어
                 continue
         if hit:
             for p in hit:
@@ -278,7 +286,6 @@ class KocomGateway:
         try:
             return await asyncio.wait_for(waiter.future, timeout=timeout)
         finally:
-            # 타임아웃 등으로 끝났을 때 누수 방지
             if waiter in self._pendings:
                 try:
                     self._pendings.remove(waiter)
@@ -293,7 +300,6 @@ class KocomGateway:
                 if item is None:
                     continue
 
-                # generate packet & expect predicate
                 try:
                     packet, expect_predicate, timeout = self.controller.generate_command(
                         item.key, item.action, **item.kwargs
@@ -305,10 +311,8 @@ class KocomGateway:
                     self._tx_queue.task_done()
                     continue
 
-                # 재시도 루프
                 success = False
                 for attempt in range(1, SEND_RETRY_MAX + 1):
-                    # idle 대기 (최대 1초)
                     LOGGER.debug("TX idle wait (max 1.0s) before '%s'...", item.action)
                     t0 = asyncio.get_running_loop().time()
                     while not self.is_idle():
@@ -317,12 +321,10 @@ class KocomGateway:
                             LOGGER.debug("Idle wait timeout (%.2fs).", asyncio.get_running_loop().time() - t0)
                             break
 
-                    # 연결 확인
                     if not self.conn._is_connected():
                         LOGGER.warning("Connection not ready. '%s' abort.", item.action)
                         break
 
-                    # 전송
                     try:
                         await self.conn.send(packet)
                     except Exception as e:
@@ -335,7 +337,6 @@ class KocomGateway:
 
                     self._last_tx_monotonic = asyncio.get_running_loop().time()
 
-                    # 확인 대기
                     try:
                         _ = await self._wait_for_confirmation(item.key, expect_predicate, timeout)
                         LOGGER.debug("Command '%s' confirmed (attempt %d).", item.action, attempt)
@@ -357,4 +358,63 @@ class KocomGateway:
                 self._tx_queue.task_done()
         except asyncio.CancelledError:
             LOGGER.debug("Sender loop cancelled")
-            raise
+            return
+        except Exception as e:
+            LOGGER.exception("Unexpected error in sender loop: %s", e)
+
+    async def _poll_loop(self) -> None:
+        LOGGER.info("Starting background polling loop (interval: %.1fs)", self._poll_interval)
+        try:
+            # 부팅 직후 엔티티 등록 및 통신 안정화 대기
+            await asyncio.sleep(10)
+
+            while True:
+                if not self.conn._is_connected():
+                    await asyncio.sleep(2)
+                    continue
+
+                # 등록된 기기 목록에서 (기기 종류, 방 번호) 세트 추출
+                target_devices: set[tuple[DeviceType, int]] = set()
+                try:
+                    for dev in list(self.registry._states.values()):
+                        if dev and hasattr(dev, "key") and dev.key.device_type not in (DeviceType.ELEVATOR, DeviceType.UNKNOWN):
+                            target_devices.add((dev.key.device_type, dev.key.room_index))
+                except Exception as e:
+                    LOGGER.warning("Error collecting polling targets: %s", e)
+
+                # 레지스트리가 비어있을 때를 대비한 기본 기기 등록
+                if not target_devices:
+                    target_devices = {
+                        (DeviceType.VENTILATION, 0),
+                        (DeviceType.THERMOSTAT, 0),
+                        (DeviceType.LIGHT, 0),
+                        (DeviceType.OUTLET, 0),
+                    }
+
+                for dev_type, room_index in target_devices:
+                    if not self.conn._is_connected():
+                        break
+
+                    while not self._tx_queue.empty():
+                        await asyncio.sleep(0.5)
+
+                    while not self.is_idle():
+                        await asyncio.sleep(0.05)
+
+                    try:
+                        packet = self.controller.generate_poll_command(dev_type, room_index)
+                        await self.conn.send(packet)
+                        self._last_tx_monotonic = asyncio.get_running_loop().time()
+                        LOGGER.debug("Polling packet sent: %s (room %d)", dev_type.name, room_index)
+                    except Exception as e:
+                        LOGGER.warning("Failed to send polling packet for %s (room %d): %s", dev_type.name, room_index, e)
+
+                    await asyncio.sleep(self._scanning_interval)
+
+                await asyncio.sleep(self._poll_interval)
+
+        except asyncio.CancelledError:
+            LOGGER.debug("Polling loop cancelled")
+            return
+        except Exception as e:
+            LOGGER.exception("Unexpected error in poll loop: %s", e)
