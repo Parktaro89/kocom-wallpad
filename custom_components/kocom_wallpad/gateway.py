@@ -21,6 +21,8 @@ from .const import (
     SEND_RETRY_MAX,
     SEND_RETRY_GAP,
     DeviceType,
+    SubType,
+    ELEVATOR_CALL_TIMEOUT_SEC,
 )
 from .models import DeviceKey, DeviceState
 from .transport import AsyncConnection
@@ -132,6 +134,7 @@ class KocomGateway:
         self._last_tx_monotonic: float = 0.0
         self._restore_mode: bool = False
         self._force_register_uid: str | None = None
+        self._elevator_call_timers: dict[tuple[int, int], asyncio.TimerHandle] = {}
 
     async def async_start(self) -> None:
         LOGGER.info("Starting gateway - %s:%s", self.host, self.port or "")
@@ -147,6 +150,9 @@ class KocomGateway:
         
         # 1. 실행 중인 태스크 취소 목록 구성
         tasks = [t for t in (self._task_poller, self._task_sender, self._task_reader) if t]
+        for timer in self._elevator_call_timers.values():
+            timer.cancel()
+        self._elevator_call_timers.clear()
         for t in tasks:
             t.cancel()
 
@@ -205,6 +211,7 @@ class KocomGateway:
                 [dev],
             )
             self._notify_pendings(dev)
+            self._update_elevator_call_timer(dev)
             return
 
         if changed:
@@ -215,6 +222,41 @@ class KocomGateway:
                 dev,
             )
         self._notify_pendings(dev)
+        self._update_elevator_call_timer(dev)
+
+    def _update_elevator_call_timer(self, dev: DeviceState) -> None:
+        """Start or clear the fallback timer for an elevator call."""
+        if dev.key.device_type != DeviceType.ELEVATOR or dev.key.sub_type != SubType.DIRECTION:
+            return
+
+        timer_key = (dev.key.room_index, dev.key.device_index)
+        previous = self._elevator_call_timers.pop(timer_key, None)
+        if previous is not None:
+            previous.cancel()
+
+        if dev.state != "called":
+            return
+
+        loop = asyncio.get_running_loop()
+        self._elevator_call_timers[timer_key] = loop.call_later(
+            ELEVATOR_CALL_TIMEOUT_SEC,
+            self._expire_elevator_call,
+            timer_key,
+        )
+
+    def _expire_elevator_call(self, timer_key: tuple[int, int]) -> None:
+        """Reset stale elevator call state when no arrival packet was received."""
+        self._elevator_call_timers.pop(timer_key, None)
+        room_index, device_index = timer_key
+        direction_key = DeviceKey(DeviceType.ELEVATOR, room_index, device_index, SubType.DIRECTION)
+        direction = self.registry.get(direction_key)
+        if direction is None or direction.state != "called":
+            return
+
+        LOGGER.info("Elevator call timed out; resetting state. room=%s", room_index)
+        switch_key = DeviceKey(DeviceType.ELEVATOR, room_index, device_index, SubType.NONE)
+        self.on_device_state(DeviceState(switch_key, Platform.SWITCH, {}, False))
+        self.on_device_state(DeviceState(direction_key, Platform.SENSOR, {}, "idle"))
 
     @callback
     def async_signal_new_device(self, platform: Platform) -> str:
