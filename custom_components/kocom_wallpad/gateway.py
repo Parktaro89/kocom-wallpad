@@ -255,8 +255,13 @@ class KocomGateway:
 
         LOGGER.info("Elevator call timed out; resetting state. room=%s", room_index)
         switch_key = DeviceKey(DeviceType.ELEVATOR, room_index, device_index, SubType.NONE)
-        self.on_device_state(DeviceState(switch_key, Platform.SWITCH, {}, False))
-        self.on_device_state(DeviceState(direction_key, Platform.SENSOR, {}, "idle"))
+        packet = getattr(direction, "_packet", bytes())
+        switch_state = DeviceState(switch_key, Platform.SWITCH, {}, False)
+        direction_state = DeviceState(direction_key, Platform.SENSOR, {}, "idle")
+        switch_state._packet = packet
+        direction_state._packet = packet
+        self.on_device_state(switch_state)
+        self.on_device_state(direction_state)
 
     @callback
     def async_signal_new_device(self, platform: Platform) -> str:
